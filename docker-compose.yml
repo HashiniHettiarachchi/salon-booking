@@ -1,0 +1,33 @@
+
+
+services:
+  mongo:
+    image: mongo
+    container_name: salon-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+
+  backend:
+    build: ./salon-booking-backend
+    container_name: salon-backend
+    ports:
+      - "5000:5000"
+    depends_on:
+      - mongo
+    environment:
+      #- MONGO_URI=mongodb://mongo:27017/salonBooking
+     - MONGO_URI=mongodb+srv://Hashini:Admin123456@salon-cluster.pmpdda2.mongodb.net/salonBooking?retryWrites=true&w=majority
+      
+
+  frontend:
+    build: ./salon-booking-frontend
+    container_name: salon-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  mongo-data:
