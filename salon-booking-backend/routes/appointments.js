@@ -1,140 +1,155 @@
 const express = require('express');
 const router = express.Router();
 const Appointment = require('../models/Appointment');
-const { auth, isStaffOrAdmin } = require('../middleware/auth');
-
-// @route   GET /api/appointments
-// @desc    Get all appointments (filtered by role)
-// @access  Private
-router.get('/', auth, async (req, res) => {
-  try {
-    let query = {};
-
-    // Customers see only their appointments
-    if (req.user.role === 'customer') {
-      query.customer = req.user.userId;
-    }
-    // Staff see only their appointments
-    else if (req.user.role === 'staff') {
-      query.staff = req.user.userId;
-    }
-    // Admin sees all appointments
-
-    const appointments = await Appointment.find(query)
-      .populate('customer', 'name email phone')
-      .populate('staff', 'name specialization')
-      .populate('service', 'name duration price')
-      .sort({ appointmentDate: 1, startTime: 1 });
-
-    res.json(appointments);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// @route   GET /api/appointments/:id
-// @desc    Get appointment by ID
-// @access  Private
-router.get('/:id', auth, async (req, res) => {
-  try {
-    const appointment = await Appointment.findById(req.params.id)
-      .populate('customer', 'name email phone')
-      .populate('staff', 'name specialization')
-      .populate('service', 'name duration price');
-
-    if (!appointment) {
-      return res.status(404).json({ message: 'Appointment not found' });
-    }
-
-    // Check if user has permission to view this appointment
-    if (
-      req.user.role === 'customer' && 
-      appointment.customer._id.toString() !== req.user.userId
-    ) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
-
-    if (
-      req.user.role === 'staff' && 
-      appointment.staff._id.toString() !== req.user.userId
-    ) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
-
-    res.json(appointment);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
+const Service = require('../models/Service');
+const User = require('../models/User');
+const { auth, isAdmin } = require('../middleware/auth');
+const EventPublisher = require('../services/eventPublisher');
 
 // @route   POST /api/appointments
-// @desc    Create new appointment
+// @desc    Create a new appointment
 // @access  Private
 router.post('/', auth, async (req, res) => {
   try {
-    const { staff, service, appointmentDate, startTime, endTime, notes, paymentMethod, amount } = req.body;
+    console.log('📅 Creating new appointment...');
+    console.log('User ID:', req.user.userId);
+    console.log('Request body:', req.body);
 
-    // Get service to fetch price if amount not provided
-    const Service = require('../models/Service');
+    const { service, staff, appointmentDate, startTime, endTime, paymentMethod, notes } = req.body;
+
+    // Validate required fields
+    if (!service || !staff || !appointmentDate || !startTime || !endTime || !paymentMethod) {
+      return res.status(400).json({ message: 'All fields are required' });
+    }
+
+    // Check if service exists
     const serviceData = await Service.findById(service);
-    
     if (!serviceData) {
       return res.status(404).json({ message: 'Service not found' });
     }
+    console.log('✅ Service found:', serviceData.name);
 
-    // Use provided amount or get from service
-    const appointmentAmount = amount || serviceData.price;
+    // Check if staff exists and is approved
+    const staffData = await User.findById(staff);
+    if (!staffData || staffData.role !== 'staff' || !staffData.isApproved) {
+      return res.status(404).json({ message: 'Staff must be approved' });
+    }
+    console.log('✅ Staff found:', staffData.name);
 
     // Check if time slot is available
     const existingAppointment = await Appointment.findOne({
       staff,
       appointmentDate,
       startTime,
-      status: { $ne: 'cancelled' }
+      status: { $nin: ['cancelled'] }
     });
 
     if (existingAppointment) {
-      return res.status(400).json({ message: 'This time slot is already booked' });
+      return res.status(400).json({ message: 'Time slot already booked' });
     }
 
+    // Create appointment
     const appointment = new Appointment({
       customer: req.user.userId,
-      staff,
       service,
+      staff,
       appointmentDate,
       startTime,
       endTime,
+      paymentMethod,
+      amount: serviceData.price,
       notes,
-      paymentMethod: paymentMethod || 'cash',
-      paymentStatus: 'pending',
-      amount: appointmentAmount
+      status: 'pending',
+      paymentStatus: 'pending'
     });
 
     await appointment.save();
+    console.log('✅ Appointment saved to database');
 
-    const populatedAppointment = await Appointment.findById(appointment._id)
-      .populate('customer', 'name email phone')
-      .populate('staff', 'name specialization')
-      .populate('service', 'name duration price');
+    // CRITICAL: Populate appointment with full details
+    await appointment.populate([
+      { path: 'customer', select: 'name email phone' },
+      { path: 'staff', select: 'name email phone specialization' },
+      { path: 'service', select: 'name duration price category' }
+    ]);
+    console.log('✅ Appointment populated');
+    console.log('Customer email:', appointment.customer?.email);
+    console.log('Staff email:', appointment.staff?.email);
 
-    res.status(201).json({ 
-      message: 'Appointment created successfully', 
-      appointment: populatedAppointment 
+    // CRITICAL: Publish event to RabbitMQ
+    console.log('📤 Publishing event to RabbitMQ...');
+    try {
+      const published = await EventPublisher.appointmentCreated(appointment.toObject());
+      if (published) {
+        console.log('✅ Event published successfully');
+      } else {
+        console.log('⚠️ Event publishing returned false');
+      }
+    } catch (publishError) {
+      console.error('❌ Event publishing failed:', publishError);
+      // Don't fail the appointment creation, just log the error
+    }
+
+    res.status(201).json({
+      message: 'Appointment created successfully',
+      appointment
     });
+
   } catch (error) {
-    console.error(error);
+    console.error('❌ Create appointment error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// @route   GET /api/appointments
+// @desc    Get appointments based on user role
+// @access  Private
+router.get('/', auth, async (req, res) => {
+  try {
+    let query = {};
+
+    // Filter based on role
+    if (req.user.role === 'customer') {
+      query.customer = req.user.userId;
+    } else if (req.user.role === 'staff') {
+      query.staff = req.user.userId;
+    }
+    // Admin sees all appointments (no filter)
+
+    // Optional filters
+    if (req.query.status) {
+      query.status = req.query.status;
+    }
+    if (req.query.startDate && req.query.endDate) {
+      query.appointmentDate = {
+        $gte: new Date(req.query.startDate),
+        $lte: new Date(req.query.endDate)
+      };
+    }
+
+    const appointments = await Appointment.find(query)
+      .populate('customer', 'name email phone')
+      .populate('staff', 'name email phone specialization')
+      .populate('service', 'name duration price category')
+      .sort({ appointmentDate: -1, startTime: -1 });
+
+    res.json(appointments);
+
+  } catch (error) {
+    console.error('❌ Get appointments error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
 
 // @route   PUT /api/appointments/:id
-// @desc    Update appointment status
+// @desc    Update appointment (confirm, cancel, complete, mark paid)
 // @access  Private
 router.put('/:id', auth, async (req, res) => {
   try {
-    const { status, appointmentDate, startTime, endTime, notes, paymentStatus, paidAt } = req.body;
+    console.log('🔄 Updating appointment:', req.params.id);
+    console.log('Update data:', req.body);
+
+    const { status, paymentStatus, paidAt } = req.body;
 
     const appointment = await Appointment.findById(req.params.id);
 
@@ -142,52 +157,86 @@ router.put('/:id', auth, async (req, res) => {
       return res.status(404).json({ message: 'Appointment not found' });
     }
 
+    // Permission check
+    const isCustomer = req.user.userId.toString() === appointment.customer.toString();
+    const isStaff = req.user.userId.toString() === appointment.staff.toString();
+    const isAdmin = req.user.role === 'admin';
+
+    if (!isCustomer && !isStaff && !isAdmin) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Store old status to detect changes
+    const oldStatus = appointment.status;
+
     // Update fields
     if (status) appointment.status = status;
-    if (appointmentDate) appointment.appointmentDate = appointmentDate;
-    if (startTime) appointment.startTime = startTime;
-    if (endTime) appointment.endTime = endTime;
-    if (notes !== undefined) appointment.notes = notes;
-    
-    // Payment status updates (staff/admin only, but we'll allow for simplicity)
     if (paymentStatus) appointment.paymentStatus = paymentStatus;
     if (paidAt) appointment.paidAt = paidAt;
 
     await appointment.save();
+    console.log('✅ Appointment updated in database');
 
-    const updatedAppointment = await Appointment.findById(appointment._id)
-      .populate('customer', 'name email phone')
-      .populate('staff', 'name specialization')
-      .populate('service', 'name duration price');
+    // CRITICAL: Populate for event
+    await appointment.populate([
+      { path: 'customer', select: 'name email phone' },
+      { path: 'staff', select: 'name email phone specialization' },
+      { path: 'service', select: 'name duration price category' }
+    ]);
+    console.log('✅ Appointment populated for event');
 
-    res.json({ 
-      message: 'Appointment updated successfully', 
-      appointment: updatedAppointment 
+    // CRITICAL: Publish events based on status change
+    try {
+      if (status && status !== oldStatus) {
+        console.log(`📤 Publishing event for status change: ${oldStatus} → ${status}`);
+        
+        if (status === 'confirmed') {
+          console.log('📤 Publishing: appointment.confirmed');
+          await EventPublisher.appointmentConfirmed(appointment.toObject());
+          console.log('✅ Confirmed event published');
+        } else if (status === 'cancelled') {
+          console.log('📤 Publishing: appointment.cancelled');
+          await EventPublisher.appointmentCancelled(appointment.toObject());
+          console.log('✅ Cancelled event published');
+        } else if (status === 'completed') {
+          console.log('📤 Publishing: appointment.completed');
+          await EventPublisher.appointmentCompleted(appointment.toObject());
+          console.log('✅ Completed event published');
+        }
+      }
+    } catch (publishError) {
+      console.error('❌ Event publishing failed:', publishError);
+    }
+
+    res.json({
+      message: 'Appointment updated successfully',
+      appointment
     });
+
   } catch (error) {
-    console.error(error);
+    console.error('❌ Update appointment error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
 
-// @route   DELETE /api/appointments/:id
-// @desc    Cancel appointment
+// @route   GET /api/appointments/:id
+// @desc    Get single appointment
 // @access  Private
-router.delete('/:id', auth, async (req, res) => {
+router.get('/:id', auth, async (req, res) => {
   try {
-    const appointment = await Appointment.findById(req.params.id);
+    const appointment = await Appointment.findById(req.params.id)
+      .populate('customer', 'name email phone')
+      .populate('staff', 'name email phone specialization')
+      .populate('service', 'name duration price category');
 
     if (!appointment) {
       return res.status(404).json({ message: 'Appointment not found' });
     }
 
-    // Update status to cancelled instead of deleting
-    appointment.status = 'cancelled';
-    await appointment.save();
+    res.json(appointment);
 
-    res.json({ message: 'Appointment cancelled successfully' });
   } catch (error) {
-    console.error(error);
+    console.error('❌ Get appointment error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
